@@ -4,9 +4,26 @@ import { join } from 'path'
 import { readFrames, writeFrame } from './framing'
 import { parseShimMsg } from './protocol'
 import type { DiscordOps } from './discord-ops'
-import { loadAccess, saveAccess } from './access'
+import { loadAccess, saveAccess, pruneExpired } from './access'
 import { loadBindings, saveBindings } from './bindings'
 import { deriveThreadName } from './session-id'
+import { gate, type GateInput } from './gate'
+
+export type InboundEvent = {
+  chat_id: string
+  message_id: string
+  user: string
+  user_id: string
+  ts: string
+  content: string
+  isDM: boolean
+  parentChannelId?: string
+  hasBotMention: boolean
+  isReplyToBot: boolean
+  attachments: { name: string; type: string; bytes: number }[]
+}
+
+export type PendingPermission = { tool_name: string; description: string; input_preview: string }
 
 export type DaemonOpts = {
   stateDir: string
@@ -16,6 +33,9 @@ export type DaemonOpts = {
 
 export type DaemonHandle = {
   shutdown(): Promise<void>
+  deliverInbound(ev: InboundEvent): void
+  permissionDecision(request_id: string, behavior: 'allow' | 'deny'): void
+  pendingPermissions: Map<string, PendingPermission>
 }
 
 type Session = {
@@ -55,7 +75,71 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
 
   const sessions = new Map<string, Session>()    // by session_id
   const threadIndex = new Map<string, string>()  // thread_id → session_id
+  const permRoutes = new Map<string, string>()   // request_id → session_id
+  const pendingPermissions = new Map<string, PendingPermission>()
   let dmSessionId: string | null = null
+
+  function deliverInbound(ev: InboundEvent): void {
+    const access = loadAccess(accessFile)
+    const pruned = pruneExpired(access)
+    const input: GateInput = {
+      senderId: ev.user_id,
+      isDM: ev.isDM,
+      channelId: ev.chat_id,
+      parentChannelId: ev.parentChannelId,
+      content: ev.content,
+      hasBotMention: ev.hasBotMention,
+      isReplyToBot: ev.isReplyToBot,
+    }
+    const result = gate(input, access)
+    if (result.action === 'pair' || pruned) saveAccess(accessFile, access)
+
+    if (result.action === 'pair') {
+      const lead = result.isResend ? 'Still pending' : 'Pairing required'
+      void ops.reply(ev.chat_id, `${lead} — run in Claude Code:\n\n/discord:access pair ${result.code}`)
+        .catch(err => process.stderr.write(`discord daemon: pair reply failed: ${err}\n`))
+      return
+    }
+    if (result.action !== 'deliver') return
+
+    let target: Session | undefined
+    if (ev.isDM) {
+      if (dmSessionId) target = sessions.get(dmSessionId)
+    } else {
+      const bound = threadIndex.get(ev.chat_id)
+      if (bound) target = sessions.get(bound)
+      else if (!ev.parentChannelId) {
+        // Non-thread guild message → fall back to DM session.
+        if (dmSessionId) target = sessions.get(dmSessionId)
+      } else {
+        // Unbound thread message → drop. Production driver may add a ❓ reaction.
+        return
+      }
+    }
+    if (!target) return
+
+    const atts = ev.attachments
+    writeFrame(target.sock, {
+      type: 'inbound',
+      chat_id: ev.chat_id, message_id: ev.message_id,
+      user: ev.user, user_id: ev.user_id, ts: ev.ts,
+      content: ev.content,
+      ...(atts.length > 0 ? {
+        attachment_count: atts.length,
+        attachments: atts.map(a => `${a.name} (${a.type}, ${(a.bytes / 1024).toFixed(0)}KB)`).join('; '),
+      } : {}),
+    })
+  }
+
+  function permissionDecision(request_id: string, behavior: 'allow' | 'deny'): void {
+    const sid = permRoutes.get(request_id)
+    pendingPermissions.delete(request_id)
+    if (!sid) return
+    permRoutes.delete(request_id)
+    const s = sessions.get(sid)
+    if (!s) return
+    writeFrame(s.sock, { type: 'permission_decision', request_id, behavior })
+  }
 
   const clients = new Set<Socket>()
   let idleTimer: NodeJS.Timeout | null = null
@@ -240,8 +324,28 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           continue
         }
 
-        // permission_request handled in later task
-        writeFrame(sock, { type: 'error', message: `not implemented yet: ${(msg as any).type}` })
+        if (msg.type === 'permission_request') {
+          if (!mySessionId) {
+            writeFrame(sock, { type: 'error', message: 'permission_request requires register first' })
+            continue
+          }
+          permRoutes.set(msg.request_id, mySessionId)
+          pendingPermissions.set(msg.request_id, {
+            tool_name: msg.tool_name, description: msg.description, input_preview: msg.input_preview,
+          })
+          const s = sessions.get(mySessionId)!
+          if (s.mode === 'thread' && s.thread_id) {
+            void ops.postPermissionPrompt(s.thread_id, msg.request_id, msg.tool_name)
+              .catch(err => process.stderr.write(`postPermissionPrompt failed: ${err}\n`))
+          } else {
+            const access = loadAccess(accessFile)
+            void ops.postPermissionPromptDM(access.allowFrom, msg.request_id, msg.tool_name)
+              .catch(err => process.stderr.write(`postPermissionPromptDM failed: ${err}\n`))
+          }
+          continue
+        }
+
+        writeFrame(sock, { type: 'error', message: `unhandled msg type: ${(msg as any).type}` })
       }
     } finally {
       if (mySessionId) {
@@ -263,5 +367,5 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
 
   armIdle()
 
-  return { shutdown }
+  return { shutdown, deliverInbound, permissionDecision, pendingPermissions }
 }

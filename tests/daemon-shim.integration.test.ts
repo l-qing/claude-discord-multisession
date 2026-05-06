@@ -144,6 +144,156 @@ describe('daemon: register', () => {
     expect(result.content[0].text).toBe('reacted')
   })
 
+  test('inbound thread message routes to bound thread shim', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'st', mode: 'thread', cwd: '/repo/x', thread_id: 'auto' })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    const threadId = ack.thread_id
+
+    daemon!.deliverInbound!({
+      chat_id: threadId, message_id: 'm1', user: 'alice', user_id: 'u1',
+      ts: '2026-01-01T00:00:00Z', content: 'hi', isDM: false, parentChannelId: 'parent-1',
+      hasBotMention: false, isReplyToBot: false, attachments: [],
+    })
+
+    const inbound = await recv(it)
+    expect(inbound.type).toBe('inbound')
+    expect(inbound.chat_id).toBe(threadId)
+    expect(inbound.content).toBe('hi')
+  })
+
+  test('inbound DM routes to dm-mode shim', async () => {
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.allowFrom = ['user-1']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-dm', mode: 'dm', cwd: '/x' })
+    await recv(it)
+
+    daemon!.deliverInbound!({
+      chat_id: 'dm-channel-1', message_id: 'm1', user: 'alice', user_id: 'user-1',
+      ts: '2026-01-01T00:00:00Z', content: 'hi', isDM: true,
+      hasBotMention: false, isReplyToBot: false, attachments: [],
+    })
+
+    const inbound = await recv(it)
+    expect(inbound.type).toBe('inbound')
+    expect(inbound.chat_id).toBe('dm-channel-1')
+  })
+
+  test('inbound unbound thread message is dropped', async () => {
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-dm', mode: 'dm', cwd: '/x' })
+    await recv(it)
+
+    daemon!.deliverInbound!({
+      chat_id: 'unknown-thread', message_id: 'm1', user: 'alice', user_id: 'u1',
+      ts: '2026-01-01T00:00:00Z', content: 'hi', isDM: false, parentChannelId: 'parent-1',
+      hasBotMention: false, isReplyToBot: false, attachments: [],
+    })
+
+    // No inbound should arrive within 100ms.
+    const got = await Promise.race([
+      recv(it),
+      new Promise(r => setTimeout(() => r(null), 100)),
+    ])
+    expect(got).toBeNull()
+  })
+
+  test('thread permission_request posts in bound thread', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'sp', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack = await recv(it)
+    const threadId = ack.thread_id
+
+    writeFrame(sock, {
+      type: 'permission_request', id: 2, request_id: 'abcde',
+      tool_name: 'Bash', description: 'rm', input_preview: '{"cmd":"rm"}',
+    })
+
+    // Wait briefly for the permission post to happen.
+    await new Promise(r => setTimeout(r, 30))
+    const promptCall = ops.calls.find(c => c.kind === 'permPrompt')
+    expect(promptCall).toMatchObject({ chat_id: threadId, request_id: 'abcde' })
+
+    daemon!.permissionDecision!('abcde', 'allow')
+    const decision = await recv(it)
+    expect(decision.type).toBe('permission_decision')
+    expect(decision.behavior).toBe('allow')
+  })
+
+  test('dm permission_request fans out to allowFrom DMs', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.allowFrom = ['user-1', 'user-2']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'sd', mode: 'dm', cwd: '/x' })
+    await recv(it)
+    writeFrame(sock, {
+      type: 'permission_request', id: 2, request_id: 'aaaaa',
+      tool_name: 'Bash', description: 'd', input_preview: '{}',
+    })
+    await new Promise(r => setTimeout(r, 30))
+    const dmCall = ops.calls.find(c => c.kind === 'permPromptDM')
+    expect(dmCall).toMatchObject({ allowFrom: ['user-1', 'user-2'], request_id: 'aaaaa' })
+  })
+
+  test('inbound DM in pairing policy issues code via reply', async () => {
+    const ops = new FakeDiscordOps()
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'sd', mode: 'dm', cwd: '/x' })
+    await recv(it)
+
+    daemon!.deliverInbound!({
+      chat_id: 'dm-1', message_id: 'm', user: 'bob', user_id: 'user-x',
+      ts: '2026-01-01T00:00:00Z', content: 'hi', isDM: true,
+      hasBotMention: false, isReplyToBot: false, attachments: [],
+    })
+
+    await new Promise(r => setTimeout(r, 30))
+    const replyCall = ops.calls.find(c => c.kind === 'reply') as any
+    expect(replyCall).toBeTruthy()
+    expect(replyCall.text).toMatch(/Pairing required/)
+    expect(replyCall.text).toMatch(/[0-9a-f]{6}/)
+  })
+
   test('thread register reuses existing binding for same session_id', async () => {
     const ops = new FakeDiscordOps()
     const { saveAccess, defaultAccess } = await import('../src/access')
