@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { createConnection, type Socket } from 'net'
-import { existsSync, openSync } from 'fs'
+import { existsSync, openSync, mkdirSync } from 'fs'
 import { spawn } from 'child_process'
 import { join, resolve, dirname } from 'path'
 import { homedir } from 'os'
@@ -31,6 +31,7 @@ async function spawnDaemon(): Promise<void> {
   // server.ts is one directory up from src/.
   const here = dirname(fileURLToPath(import.meta.url))
   const entry = resolve(here, '..', 'server.ts')
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const fd = openSync(LOG_PATH, 'a')
   const child = spawn(process.execPath, [entry, '--daemon'], {
     detached: true, stdio: ['ignore', fd, fd], env: process.env,
