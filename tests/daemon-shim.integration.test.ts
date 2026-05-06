@@ -113,6 +113,37 @@ describe('daemon: register', () => {
     expect(ack.code).toBe('parent_channel_unset')
   })
 
+  test('reply tool_call forwards to ops.reply and returns tool_result', async () => {
+    const ops = new FakeDiscordOps()
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-tool', mode: 'dm', cwd: '/x' })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+
+    writeFrame(sock, { type: 'tool_call', id: 2, name: 'reply', args: { chat_id: 'dm-1', text: 'hi' } })
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.id).toBe(2)
+    expect(result.isError).toBeUndefined()
+    expect(ops.calls.find(c => c.kind === 'reply')).toMatchObject({ chat_id: 'dm-1', text: 'hi' })
+  })
+
+  test('react tool_call returns success', async () => {
+    const ops = new FakeDiscordOps()
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-tool', mode: 'dm', cwd: '/x' })
+    await recv(it)
+    writeFrame(sock, { type: 'tool_call', id: 2, name: 'react', args: { chat_id: 'c', message_id: 'm', emoji: '👀' } })
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.content[0].text).toBe('reacted')
+  })
+
   test('thread register reuses existing binding for same session_id', async () => {
     const ops = new FakeDiscordOps()
     const { saveAccess, defaultAccess } = await import('../src/access')

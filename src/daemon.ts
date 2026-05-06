@@ -78,6 +78,51 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
     try { unlinkSync(pidPath) } catch {}
   }
 
+  async function runTool(name: string, args: Record<string, unknown>): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+    try {
+      switch (name) {
+        case 'reply': {
+          const ids = await ops.reply(
+            String(args.chat_id),
+            String(args.text),
+            { reply_to: args.reply_to as string | undefined, files: args.files as string[] | undefined },
+          )
+          const text = ids.length === 1 ? `sent (id: ${ids[0]})` : `sent ${ids.length} parts (ids: ${ids.join(', ')})`
+          return { content: [{ type: 'text', text }] }
+        }
+        case 'react':
+          await ops.react(String(args.chat_id), String(args.message_id), String(args.emoji))
+          return { content: [{ type: 'text', text: 'reacted' }] }
+        case 'edit_message': {
+          const id = await ops.edit(String(args.chat_id), String(args.message_id), String(args.text))
+          return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+        }
+        case 'fetch_messages': {
+          const limit = Number(args.limit ?? 20)
+          const arr = await ops.fetch(String(args.channel ?? args.chat_id), limit)
+          const out = arr.length === 0
+            ? '(no messages)'
+            : arr.map(m =>
+                `[${m.ts}] ${m.author_name}: ${m.content.replace(/[\r\n]+/g, ' ⏎ ')}  (id: ${m.id}${m.attachment_count > 0 ? ` +${m.attachment_count}att` : ''})`
+              ).join('\n')
+          return { content: [{ type: 'text', text: out }] }
+        }
+        case 'download_attachment': {
+          const inboxDir = join(stateDir, 'inbox')
+          const out = await ops.downloadAttachments(String(args.chat_id), String(args.message_id), inboxDir)
+          if (out.length === 0) return { content: [{ type: 'text', text: 'message has no attachments' }] }
+          const lines = out.map(f => `  ${f.path}  (${f.name}, ${f.type}, ${(f.bytes / 1024).toFixed(0)}KB)`)
+          return { content: [{ type: 'text', text: `downloaded ${out.length} attachment(s):\n${lines.join('\n')}` }] }
+        }
+        default:
+          return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
+      }
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err)
+      return { content: [{ type: 'text', text: `${name} failed: ${m}` }], isError: true }
+    }
+  }
+
   async function handleConnection(sock: Socket): Promise<void> {
     let mySessionId: string | null = null
     try {
@@ -189,7 +234,13 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           continue
         }
 
-        // tool_call / permission_request handled in later tasks
+        if (msg.type === 'tool_call') {
+          const result = await runTool(msg.name, msg.args as Record<string, unknown>)
+          writeFrame(sock, { type: 'tool_result', id: msg.id, ...result })
+          continue
+        }
+
+        // permission_request handled in later task
         writeFrame(sock, { type: 'error', message: `not implemented yet: ${(msg as any).type}` })
       }
     } finally {
