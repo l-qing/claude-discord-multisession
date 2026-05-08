@@ -1,77 +1,120 @@
-# Discord
+# Discord — multi-session edition
 
-Connect a Discord bot to your Claude Code with an MCP server.
+Connect a Discord bot to your Claude Code with an MCP server. One bot serves
+N concurrent CC sessions on a single host, each bound to its own Discord
+thread; DMs land in a designated DM session.
 
-When the bot receives a message, the MCP server forwards it to Claude and provides tools to reply, react, and edit messages.
+When the bot receives a message, the MCP server forwards it to Claude and
+exposes tools to reply, react, edit, fetch history, and download attachments.
+
+## Forked from
+
+This is a fork of the official Discord plugin in
+[`anthropics/claude-plugins-official`](https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/discord),
+based on commit
+[`48aa4351`](https://github.com/anthropics/claude-plugins-official/commit/48aa4351).
+Apache-2.0; modified files carry change notices per the license.
+
+What this fork adds on top of upstream:
+
+- One bot serving multiple CC sessions, each bound to its own Discord thread.
+- Long-lived **daemon** owning the single Discord gateway; lightweight
+  per-session **shim** speaks MCP to CC and a UDS protocol to the daemon.
+- `DISCORD_THREAD_ID=auto` to lazy-create a thread per session, or pass an
+  existing thread snowflake to bind to one.
+- `DISCORD_THREAD_NAME` to override the auto-generated thread name.
+- Permission prompts post inside the bound thread instead of fanning across
+  all DMs.
+
+Single-host only by design; multi-machine is out of scope.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
+- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
+- A clone of this repo somewhere on disk (it's a private fork, installed via
+  a local marketplace rather than `claude-plugins-official`).
+
+```sh
+git clone git@github.com:danielfbm/claude-discord-multisession.git
+cd claude-discord-multisession
+bun install
+```
 
 ## Quick Setup
-> Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md) for groups and multi-user setups.
+
+> Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md)
+> for groups, multi-user setups, and the `access.json` schema.
 
 **1. Create a Discord application and bot.**
 
-Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. Give it a name.
+In the [Discord Developer Portal](https://discord.com/developers/applications)
+click **New Application** → name it. Sidebar → **Bot**:
 
-Navigate to **Bot** in the sidebar. Give your bot a username.
+- Set a username.
+- **Privileged Gateway Intents** → enable **Message Content Intent**
+  (without this every inbound message has empty content).
+- Scroll up → **Reset Token** → copy the ~70-char token (only shown once).
+  This is your `DISCORD_BOT_TOKEN`. Note: it's not the Application ID, the
+  Client Secret, or the Public Key.
 
-Scroll down to **Privileged Gateway Intents** and enable **Message Content Intent** — without this the bot receives messages with empty content.
-
-**2. Generate a bot token.**
-
-Still on the **Bot** page, scroll up to **Token** and press **Reset Token**. Copy the token — it's only shown once. Hold onto it for step 5.
-
-**3. Invite the bot to a server.**
+**2. Invite the bot to a guild.**
 
 Discord won't let you DM a bot unless you share a server with it.
 
-Navigate to **OAuth2** → **URL Generator**. Select the `bot` scope. Under **Bot Permissions**, enable:
+OAuth2 → **URL Generator**. Scope: `bot`. Permissions:
 
 - View Channels
 - Send Messages
 - Send Messages in Threads
-- Create Public Threads
+- **Create Public Threads** *(needed for multi-session auto-threads)*
 - Read Message History
 - Attach Files
 - Add Reactions
 
-Integration type: **Guild Install**. Copy the **Generated URL**, open it, and add the bot to any server you're in.
+Or use the precomputed integer `309237746752` directly:
 
-> For DM-only use you technically need zero permissions — but enabling them now saves a trip back when you want guild channels later.
-
-**4. Install the plugin.**
-
-These are Claude Code commands — run `claude` to start a session first.
-
-Install the plugin:
 ```
-/plugin install discord@claude-plugins-official
-/reload-plugins
+https://discord.com/api/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=309237746752
 ```
 
-**5. Give the server the token.**
+**3. Install the plugin from this local repo.**
+
+Inside a CC session:
+
+```
+/plugin marketplace add /absolute/path/to/claude-discord-multisession
+/plugin install discord@danielfbm-discord
+```
+
+**4. Save the bot token.**
 
 ```
 /discord:configure MTIz...
 ```
 
-Writes `DISCORD_BOT_TOKEN=...` to `~/.claude/channels/discord/.env`. You can also write that file by hand, or set the variable in your shell environment — shell takes precedence.
+Writes `DISCORD_BOT_TOKEN=...` to `~/.claude/channels/discord/.env`. You can
+also write that file by hand, or `export DISCORD_BOT_TOKEN=...` — shell env
+takes precedence over the file.
 
-> To run multiple bots on one machine (different tokens, separate allowlists), point `DISCORD_STATE_DIR` at a different directory per instance.
+> To run multiple bots on one machine (different tokens, separate
+> allowlists), point `DISCORD_STATE_DIR` at a different directory per
+> instance.
 
-**6. Relaunch with the channel flag.**
+**5. Relaunch with the channel flag.**
 
-The server won't connect without this — exit your session and start a new one:
+This fork lives in a custom marketplace, so it isn't on Anthropic's
+managed channel allowlist. Use the development flag:
 
 ```sh
-claude --channels plugin:discord@claude-plugins-official
+claude --dangerously-load-development-channels plugin:discord@danielfbm-discord
 ```
 
-**7. Pair.**
+The flag opts you into running an unapproved channel source. Standard
+prompt-injection caveats apply — trust the bot/server you connect to.
 
-With Claude Code running from the previous step, DM your bot on Discord — it replies with a pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
+**6. Pair.**
+
+DM the bot. It replies with a pairing code. Inside CC:
 
 ```
 /discord:access pair <code>
@@ -79,46 +122,91 @@ With Claude Code running from the previous step, DM your bot on Discord — it r
 
 Your next DM reaches the assistant.
 
-**8. Lock it down.**
+**7. Lock it down.**
 
-Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers don't get pairing-code replies. Ask Claude to do it, or `/discord:access policy allowlist` directly.
+```
+/discord:access policy allowlist
+```
 
-## Access control
-
-See **[ACCESS.md](./ACCESS.md)** for DM policies, guild channels, mention detection, delivery config, skill commands, and the `access.json` schema.
-
-Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mode, right-click → Copy ID). Default policy is `pairing`. Guild channels are opt-in per channel ID.
+Stops strangers from getting pairing replies. Pairing was for capturing IDs;
+the allowlist holds them.
 
 ## Multi-session via threads
 
-Run multiple Claude Code sessions through one bot, each in its own Discord
-thread under a configured parent channel.
+Run multiple CC sessions through one bot, each in its own Discord thread.
 
-1. Pick a guild channel to host threads. Get its snowflake (Developer Mode →
-   right-click → Copy Channel ID).
-2. Set it as the parent channel:
+**1. Pick a parent channel.** Get its snowflake (Developer Mode →
+right-click → Copy Channel ID). The bot must be a member of the guild that
+owns this channel and have `Create Public Threads` there.
 
-   ```
-   /discord:configure parent 846209781206941736
-   ```
+**2. Set it as the parent.** Inside any CC session that has the plugin
+loaded:
 
-   This also opts the channel into `groups`, so inbound thread messages
-   pass the gate.
-3. In any working directory, launch Claude Code with the channel flag and
-   ask for an auto-thread:
+```
+/discord:configure parent 1502124892781547632
+```
 
-   ```sh
-   DISCORD_THREAD_ID=auto claude --channels plugin:discord@claude-plugins-official
-   ```
+This writes `parentChannelId` and adds the channel to `groups` so inbound
+thread messages pass the access gate.
 
-   The bot creates a thread named `<cwd-basename>-<short-id>` and binds
-   this session to it. Subsequent `claude` runs in the same directory
-   reuse the same thread.
-4. Launch a *second* session in another directory the same way; it gets
-   its own thread.
-5. Plain DMs to the bot continue to land in whichever session was launched
-   without `DISCORD_THREAD_ID` (the "DM session"). Only one DM session is
-   allowed at a time.
+**3. Launch a thread session from any working directory:**
+
+```sh
+cd ~/some/project
+DISCORD_THREAD_ID=auto \
+  claude --dangerously-load-development-channels plugin:discord@danielfbm-discord
+```
+
+The bot creates a thread named `<cwd-basename>` (e.g. `project`) and binds
+this CC session to it. Subsequent launches from the same cwd reuse the same
+thread.
+
+**4. Launch additional sessions from other directories** the same way. Each
+cwd produces a distinct session_id, a distinct thread, and a distinct shim.
+
+**5. DMs** continue to land in whichever session was launched *without*
+`DISCORD_THREAD_ID` (the "DM session"). Only one DM session at a time.
+
+### Custom thread names
+
+Override the default basename naming with an env var:
+
+```sh
+DISCORD_THREAD_ID=auto DISCORD_THREAD_NAME='Sprint 42 refactor' \
+  claude --dangerously-load-development-channels plugin:discord@danielfbm-discord
+```
+
+The name is sanitized to word/space/`.`/`-` characters, trimmed, and capped
+at 90 chars. Applied only at thread *creation* time — for an already-bound
+cwd, edit `bindings.json` (see "Resetting a binding") or rename the thread
+in Discord directly.
+
+### Binding to an existing thread
+
+If you've already created a thread by hand and want CC to bind to it:
+
+```sh
+# Get the thread ID: right-click the thread → Copy Thread ID
+DISCORD_THREAD_ID=1502195236900966400 \
+  claude --dangerously-load-development-channels plugin:discord@danielfbm-discord
+```
+
+The thread's parent channel must be opted into `groups` (step 2 of
+Multi-session) for inbound messages to pass the gate.
+
+### Resetting a binding
+
+To start fresh in a working directory — new thread for the same cwd —
+remove the session entry from `bindings.json`:
+
+```sh
+# session_id is sha1(realpath(cwd)).slice(0, 12)
+jq 'del(."<session_id>")' ~/.claude/channels/discord/bindings.json \
+  > /tmp/b.json && mv /tmp/b.json ~/.claude/channels/discord/bindings.json
+```
+
+The next launch with `DISCORD_THREAD_ID=auto` creates a new thread. The old
+one stays in Discord as an orphan; archive or delete it manually.
 
 ### How it works
 
@@ -127,42 +215,45 @@ session's MCP server (the **shim**) talks to the daemon over a Unix socket
 at `~/.claude/channels/discord/daemon.sock`. The daemon is lazy-spawned by
 the first shim and idle-exits 60 s after the last shim disconnects.
 
-### Permissions
+Session identity: `sha1(realpath(launch_cwd))[:12]`. One CC per cwd.
 
-Thread sessions post permission prompts inside the bound thread (so the
+Permission prompts in a thread session post inside the bound thread (so the
 human can answer in-context). The DM session keeps fanning prompts to all
 DMs in `allowFrom`.
 
-### Bot permissions
+## Access control
 
-Add **Create Public Threads** alongside the others listed in step 3 of
-Quick Setup so the bot can auto-create threads under your parent channel.
+See **[ACCESS.md](./ACCESS.md)** for DM policies, guild channels, mention
+detection, delivery config, skill commands, and the `access.json` schema.
 
-### Resetting a binding
-
-If you want to start fresh in a working directory (new thread for the same
-cwd), edit `~/.claude/channels/discord/bindings.json` and remove the
-session entry. The next launch creates a new thread.
+Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer
+Mode, right-click → Copy ID). Default DM policy is `pairing`. Guild channels
+are opt-in per channel ID via `groups`.
 
 ## Tools exposed to the assistant
 
 | Tool | Purpose |
 | --- | --- |
-| `reply` | Send to a channel. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments — max 10 files, 25MB each. Auto-chunks; files attach to the first chunk. Returns the sent message ID(s). |
-| `react` | Add an emoji reaction to any message by ID. Unicode emoji work directly; custom emoji need `<:name:id>` form. |
+| `reply` | Send to a channel. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments — max 10 files, 25 MB each. Auto-chunks; files attach to the first chunk. Returns sent message ID(s). |
+| `react` | Add an emoji reaction by message ID. Unicode emoji work directly; custom emoji need `<:name:id>` form. |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
-| `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
-| `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
+| `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; attachments marked `+Natt`. |
+| `download_attachment` | Download all attachments from a specific message ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. |
 
 Inbound messages trigger a typing indicator automatically — Discord shows
-"botname is typing…" while the assistant works on a response.
+"botname is typing…" while the assistant works.
 
 ## Attachments
 
-Attachments are **not** auto-downloaded. The `<channel>` notification lists
-each attachment's name, type, and size — the assistant calls
+Not auto-downloaded. The `<channel>` notification lists each attachment's
+name, type, and size; the assistant calls
 `download_attachment(chat_id, message_id)` when it actually wants the file.
 Downloads land in `~/.claude/channels/discord/inbox/`.
 
 Same path for attachments on historical messages found via `fetch_messages`
 (messages with attachments are marked `+Natt`).
+
+## License
+
+Apache-2.0. See [LICENSE](./LICENSE). Original work copyright Anthropic;
+modifications copyright the contributors of this fork.
