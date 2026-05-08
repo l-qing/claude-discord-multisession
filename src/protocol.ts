@@ -7,6 +7,7 @@ export const RegisterMsg = z.object({
   mode: z.enum(['dm', 'thread']),
   cwd: z.string(),
   thread_id: z.string().optional(),
+  thread_name: z.string().optional(),
 }).superRefine((v, ctx) => {
   if (v.mode === 'thread' && !v.thread_id) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'thread_id required when mode=thread' })

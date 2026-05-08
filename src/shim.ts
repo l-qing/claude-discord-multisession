@@ -16,6 +16,7 @@ const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'c
 const SOCK_PATH = join(STATE_DIR, 'daemon.sock')
 const LOG_PATH = join(STATE_DIR, 'daemon.log')
 const THREAD_ENV = process.env.DISCORD_THREAD_ID
+const THREAD_NAME_ENV = process.env.DISCORD_THREAD_NAME
 const SESSION_ID = process.env.CLAUDE_SESSION_ID ?? deriveSessionId(process.cwd())
 
 async function tryConnect(): Promise<Socket | null> {
@@ -221,6 +222,7 @@ export async function runShim(): Promise<void> {
     type: 'register', id: nextId++, session_id: SESSION_ID,
     mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
     ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
+    ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
   })
   if (ack.type !== 'register_ack') {
     process.stderr.write(`discord shim: register failed (${ack.code}): ${ack.message}\n`)

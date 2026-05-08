@@ -18,18 +18,26 @@ describe('session-id', () => {
     expect(deriveSessionId('/tmp/a')).not.toBe(deriveSessionId('/tmp/b'))
   })
 
-  test('deriveThreadName uses basename + short id', () => {
-    expect(deriveThreadName('/home/me/my-project', 'abcdef0123ab')).toBe('my-project-abcdef')
+  test('deriveThreadName uses basename', () => {
+    expect(deriveThreadName('/home/me/my-project', 'abcdef0123ab')).toBe('my-project')
   })
 
-  test('deriveThreadName truncates basename to 80 chars', () => {
+  test('deriveThreadName truncates basename to 90 chars', () => {
     const long = '/x/' + 'a'.repeat(200)
     const name = deriveThreadName(long, 'abcdef0123ab')
-    expect(name.length).toBeLessThanOrEqual(100)
-    expect(name.endsWith('-abcdef')).toBe(true)
+    expect(name.length).toBeLessThanOrEqual(90)
   })
 
   test('deriveThreadName falls back when basename empty', () => {
-    expect(deriveThreadName('/', 'abcdef0123ab')).toBe('claude-abcdef')
+    expect(deriveThreadName('/', 'abcdef0123ab')).toBe('claude')
+  })
+
+  test('deriveThreadName honors override and sanitizes', () => {
+    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', 'My Custom Thread')).toBe('My Custom Thread')
+    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', '  bad/chars\n!  ')).toBe('badchars')
+  })
+
+  test('deriveThreadName falls back to basename when override is blank after sanitization', () => {
+    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', '!!!')).toBe('foo')
   })
 })

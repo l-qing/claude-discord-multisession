@@ -269,7 +269,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 })
                 continue
               }
-              const name = deriveThreadName(msg.cwd, msg.session_id)
+              const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
               try {
                 const t = await ops.createThread(access.parentChannelId, name)
                 threadId = t.thread_id

@@ -13,12 +13,19 @@ export function deriveSessionId(cwd: string): string {
 }
 
 /**
- * Discord thread name derived from cwd basename + short session id.
- * Discord caps thread names at 100 chars; we cap basename at 80 to leave
- * room for the suffix.
+ * Discord thread name. Priority:
+ *   1. DISCORD_THREAD_NAME env (passed through register.thread_name)
+ *   2. cwd basename (if unique enough for your workflow)
+ *   3. fallback: basename + short id (the v1 default, kept as a safety net
+ *      when callers explicitly want collision-resistant naming)
+ *
+ * Discord caps thread names at 100 chars; we cap at 90 to leave headroom.
  */
-export function deriveThreadName(cwd: string, sessionId: string): string {
+export function deriveThreadName(cwd: string, sessionId: string, override?: string): string {
+  if (override) {
+    const safe = override.replace(/[^\w\s.-]/g, '').trim().slice(0, 90)
+    if (safe) return safe
+  }
   const raw = basename(cwd) || 'claude'
-  const trimmed = raw.length > 80 ? raw.slice(0, 80) : raw
-  return `${trimmed}-${sessionId.slice(0, 6)}`
+  return raw.length > 90 ? raw.slice(0, 90) : raw
 }
