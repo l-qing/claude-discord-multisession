@@ -1,0 +1,12 @@
+{
+  "name": "danielfbm-discord",
+  "owner": {
+    "name": "danielfbm"
+  },
+  "plugins": [
+    {
+      "name": "discord",
+      "source": "."
+    }
+  ]
+}
