@@ -223,6 +223,27 @@ jq 'del(."<session_id>")' ~/.claude/channels/discord/bindings.json \
 The next launch with `DISCORD_THREAD_ID=auto` creates a new thread. The old
 one stays in Discord as an orphan; archive or delete it manually.
 
+#### Diagnosing `*_session_taken` errors first
+
+`dm_session_taken` / `thread_session_taken` means the daemon already has a
+live registration for this `session_id` (or DM slot, or thread). The
+`register_err` message names the current holder, so you usually do *not*
+need to touch `bindings.json` at all:
+
+```
+register failed (thread_session_taken):
+  this session_id is already registered
+  (holder pid=12345 thread_id=1234567890 cwd="/path/to/cwd" age_sec=42.7)
+```
+
+- If `pid=<n>` and `ps -p <n>` shows it alive → another Claude Code is
+  holding this cwd. Close that one (or use a different cwd).
+- If `pid=?` (old shim that didn't self-report) or `ps -p <n>` is dead →
+  the daemon is stuck on a half-dead socket. Wait a moment for cleanup or
+  restart the daemon (kill `~/.claude/channels/discord/daemon.pid`).
+- The `jq del` above only helps when you actually want a *new* thread for
+  this cwd — it does not evict an in-memory holder.
+
 ### How it works
 
 A long-lived **daemon** owns the single Discord gateway connection. Each
@@ -457,6 +478,11 @@ grep "register outcome=" ~/.claude/channels/discord/daemon.log
 of creating a fresh Discord thread. If a binding shows up that you cannot
 recall creating, grep the log for its `session_id` to see the original
 register frame's `cwd` and timestamp.
+
+Register failures additionally carry `holder_pid=`, `holder_cwd=`,
+`holder_thread_id=`, `holder_age_sec=` (and `holder_session_id=` on DM /
+thread-bind paths) — these identify the live session that owns the
+contested resource, mirroring the human message in `register_err`.
 
 ## License
 

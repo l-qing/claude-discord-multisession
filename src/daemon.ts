@@ -59,6 +59,82 @@ type Session = {
   thread_id: string | null
   parent_id: string | null
   sock: Socket
+  // Diagnostics — captured at register time, never mutated afterwards.
+  // Their sole purpose is to enrich the message + log emitted when a
+  // duplicate register arrives, so the user can tell "the prior shim is
+  // still alive (close it)" from "a stale half-dead socket (wait or
+  // restart daemon)" at a glance. Not persisted to bindings.json —
+  // resetting the daemon clears them, which is fine.
+  registered_at: number
+  cwd: string
+  canonical_cwd?: string
+  shim_pid?: number
+}
+
+// Render a one-line, key=value description of the current holder of a
+// session_id / thread_id so it can be embedded inside register_err
+// `message` and the structured logRegister entry. Kept grep-friendly:
+// quoting only when the value contains whitespace / quotes so a copy of
+// the daemon.log line still parses with the existing format contract.
+//
+// thread_id is mode-aware: 'pending' for a thread session still on the
+// placeholder, the real thread id once finalized, and 'dm' for DM-mode
+// sessions where the field has no meaningful value. This keeps the
+// human-readable message and the holder_thread_id structured log key in
+// agreement — without this, an operator grepping daemon.log saw no
+// `holder_thread_id=` key for placeholder collisions even though the
+// message string showed "thread_id=pending".
+function describeHolder(s: Session | undefined): string {
+  if (!s) return 'holder=unknown'
+  const ageSec = ((Date.now() - s.registered_at) / 1000).toFixed(1)
+  const pid = s.shim_pid !== undefined ? String(s.shim_pid) : '?'
+  const tid = s.mode === 'thread' ? (s.thread_id ?? 'pending') : 'dm'
+  const cwd = /[\s"]/.test(s.cwd) ? JSON.stringify(s.cwd) : s.cwd
+  return `holder pid=${pid} thread_id=${tid} cwd=${cwd} age_sec=${ageSec}`
+}
+
+// Build the diagnostics block stamped onto a Session at register time.
+// At placeholder set, pass `msg` — `registered_at` is freshly stamped
+// with Date.now(). At finalize, pass the existing placeholder Session so
+// the original `registered_at` is preserved, satisfying the "captured at
+// register time, never mutated afterwards" contract documented on the
+// Session type. Re-stamping at finalize would otherwise lose the
+// createThread / verifyThreadParent / upsertBinding latency from
+// age_sec, understating holder lifetime in the diagnostic.
+function diagnosticsBlock(
+  source: { cwd: string; canonical_cwd?: string; shim_pid?: number; registered_at?: number },
+): { registered_at: number; cwd: string; canonical_cwd?: string; shim_pid?: number } {
+  return {
+    registered_at: source.registered_at ?? Date.now(),
+    cwd: source.cwd,
+    ...(source.canonical_cwd !== undefined ? { canonical_cwd: source.canonical_cwd } : {}),
+    ...(source.shim_pid !== undefined ? { shim_pid: source.shim_pid } : {}),
+  }
+}
+
+// Structured-log counterpart to describeHolder. Returns the object to
+// spread into a logRegister call so the daemon.log line carries every
+// holder_* field the message string already names — keeps text and
+// structured views of the same collision in sync.
+//
+// `holderSid` is optional because the "session_id collision" path
+// already records the session_id of the colliding caller (which equals
+// the holder's session_id by definition), so naming it again would be
+// redundant. DM and thread-bind paths look up the holder via a
+// different key (dmSessionId / threadIndex), so they pass holderSid
+// explicitly to identify which session owns the contested resource.
+function holderLogFields(
+  holder: Session | undefined,
+  holderSid?: string | null,
+): Record<string, unknown> {
+  const tid = holder?.mode === 'thread' ? (holder.thread_id ?? 'pending') : null
+  return {
+    holder_pid: holder?.shim_pid ?? null,
+    holder_thread_id: tid,
+    holder_cwd: holder?.cwd ?? null,
+    holder_age_sec: holder ? ((Date.now() - holder.registered_at) / 1000).toFixed(1) : null,
+    ...(holderSid !== undefined ? { holder_session_id: holderSid } : {}),
+  }
 }
 
 // Single-line key=value log emitted for every register attempt so daemon.log
@@ -572,9 +648,18 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
 
           if (sessions.has(msg.session_id)) {
             const code = msg.mode === 'dm' ? 'dm_session_taken' : 'thread_session_taken'
-            const message = 'this session_id is already registered'
+            // Look up the prior holder so the caller can tell "another live
+            // shim is holding this" from "a half-dead socket still in the
+            // map" without needing daemon.log access.
+            const holder = sessions.get(msg.session_id)
+            const message = `this session_id is already registered (${describeHolder(holder)})`
             writeFrame(sock, { type: 'register_err', id: msg.id, code, message })
-            logRegister({ outcome: 'err', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code, message })
+            logRegister({
+              outcome: 'err', mode: msg.mode,
+              session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd,
+              code, message,
+              ...holderLogFields(holder),
+            })
             continue
           }
 
@@ -585,7 +670,15 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           // placeholder uses thread_id=null; inbound routing keys off
           // threadIndex (still unset) or dmSessionId (also still unset), so
           // no traffic can land on this half-registered session yet.
-          sessions.set(msg.session_id, { session_id: msg.session_id, mode: msg.mode, thread_id: null, parent_id: null, sock })
+          // Stamp diagnostics on the placeholder so a concurrent register
+          // landing during the await window below (createThread /
+          // verifyThreadParent) sees who actually holds this slot — not
+          // just "someone took it" with no further info. registered_at
+          // is captured here and never re-stamped afterwards.
+          sessions.set(msg.session_id, {
+            session_id: msg.session_id, mode: msg.mode, thread_id: null, parent_id: null, sock,
+            ...diagnosticsBlock(msg),
+          })
 
           // reservedThreadId tracks the thread_id we have synchronously
           // claimed in threadIndex on behalf of this session, so the
@@ -604,9 +697,17 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           try {
             if (msg.mode === 'dm') {
               if (dmSessionId !== null) {
-                const errMessage = 'a DM-mode shim is already registered'
+                // Identify the current DM holder for the same diagnostic
+                // reason as the session_id-collision path above.
+                const holder = sessions.get(dmSessionId)
+                const errMessage = `a DM-mode shim is already registered (${describeHolder(holder)})`
                 writeFrame(sock, { type: 'register_err', id: msg.id, code: 'dm_session_taken', message: errMessage })
-                logRegister({ outcome: 'err', mode: 'dm', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'dm_session_taken', message: errMessage })
+                logRegister({
+                  outcome: 'err', mode: 'dm',
+                  session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd,
+                  code: 'dm_session_taken', message: errMessage,
+                  ...holderLogFields(holder, dmSessionId),
+                })
                 continue
               }
               // Send the ack BEFORE claiming dmSessionId / mySessionId. If
@@ -637,9 +738,22 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 // the deferred migration further down is skipped because
                 // we `continue` straight to the per-register finally block.
                 if (threadIndex.has(threadId)) {
-                  const errMessage = 'this thread is already bound to another session'
+                  // Reverse-lookup the session_id currently bound to this
+                  // thread_id, then fetch its Session for holder metadata.
+                  // Both lookups may legitimately come up empty during the
+                  // narrow window where threadIndex has been set but the
+                  // owning Session has just been removed by its finally
+                  // block — describeHolder handles undefined gracefully.
+                  const holderSid = threadIndex.get(threadId)
+                  const holder = holderSid ? sessions.get(holderSid) : undefined
+                  const errMessage = `this thread is already bound to another session (${describeHolder(holder)})`
                   writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
-                  logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
+                  logRegister({
+                    outcome: 'err', mode: 'thread',
+                    session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd,
+                    thread_id: threadId, code: 'thread_session_taken', message: errMessage,
+                    ...holderLogFields(holder, holderSid ?? null),
+                  })
                   continue
                 }
                 threadIndex.set(threadId, msg.session_id)
@@ -706,9 +820,18 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
               // correctness gate — the post-await recheck below is what
               // actually prevents concurrent claims from racing past us.
               if (threadIndex.has(threadId)) {
-                const errMessage = 'this thread is already bound to another session'
+                // Pre-await fast-path reject: identify holder for diagnostics
+                // (see describeHolder rationale at top of file).
+                const holderSid = threadIndex.get(threadId)
+                const holder = holderSid ? sessions.get(holderSid) : undefined
+                const errMessage = `this thread is already bound to another session (${describeHolder(holder)})`
                 writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
-                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
+                logRegister({
+                  outcome: 'err', mode: 'thread',
+                  session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd,
+                  thread_id: threadId, code: 'thread_session_taken', message: errMessage,
+                  ...holderLogFields(holder, holderSid ?? null),
+                })
                 continue
               }
               const parent = await ops.verifyThreadParent(threadId)
@@ -720,11 +843,19 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
               }
               parentId = parent
               // Recheck post-await: a concurrent register could have claimed
-              // this thread while we were verifying its parent.
+              // this thread while we were verifying its parent. Same holder
+              // diagnostics as the pre-await reject above.
               if (threadIndex.has(threadId)) {
-                const errMessage = 'this thread is already bound to another session'
+                const holderSid = threadIndex.get(threadId)
+                const holder = holderSid ? sessions.get(holderSid) : undefined
+                const errMessage = `this thread is already bound to another session (${describeHolder(holder)})`
                 writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
-                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
+                logRegister({
+                  outcome: 'err', mode: 'thread',
+                  session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd,
+                  thread_id: threadId, code: 'thread_session_taken', message: errMessage,
+                  ...holderLogFields(holder, holderSid ?? null),
+                })
                 continue
               }
               threadIndex.set(threadId, msg.session_id)
@@ -797,9 +928,20 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             // `mySessionId` is never assigned to a now-released session_id.
             writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: threadId })
             logRegister({ outcome: 'ok', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, reuse: reuseFlag })
-            // Finalize: upgrade the placeholder session entry to the real one
-            // and bind this connection's outbound identity.
-            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, parent_id: parentId, sock })
+            // Finalize: upgrade the placeholder session entry to the real
+            // one and bind this connection's outbound identity. Inherit the
+            // placeholder's diagnostics (registered_at / cwd / canonical_cwd
+            // / shim_pid) so they survive this set() AND keep their original
+            // values — re-stamping registered_at here would silently subtract
+            // the createThread / verifyThreadParent / upsertBinding latency
+            // from age_sec and break the Session-type invariant that these
+            // fields are immutable for the session's lifetime.
+            const placeholder = sessions.get(msg.session_id)!
+            sessions.set(msg.session_id, {
+              session_id: msg.session_id, mode: 'thread',
+              thread_id: threadId, parent_id: parentId, sock,
+              ...diagnosticsBlock(placeholder),
+            })
             mySessionId = msg.session_id
             committed = true
           } finally {

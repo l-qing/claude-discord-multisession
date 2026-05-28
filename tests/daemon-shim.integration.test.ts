@@ -157,6 +157,190 @@ describe('daemon: register', () => {
     expect(ack.code).toBe('parent_channel_unset')
   })
 
+  // Diagnostics: when a duplicate register hits the in-memory sessions map,
+  // the register_err message must identify the holder (pid + cwd + thread_id)
+  // so the user can tell "another live shim is holding this" from "stale
+  // half-dead socket" without grepping daemon.log.
+  test('duplicate session_id: register_err message includes holder pid + cwd + thread_id', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, {
+      type: 'register', id: 1, session_id: 'dup-sid', mode: 'thread',
+      cwd: '/repo/holder-cwd', thread_id: 'auto', shim_pid: 99001,
+    })
+    const ack1 = await recv(it1)
+    expect(ack1.type).toBe('register_ack')
+    const heldThreadId: string = ack1.thread_id
+
+    // Second shim tries the same session_id.
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, {
+      type: 'register', id: 1, session_id: 'dup-sid', mode: 'thread',
+      cwd: '/repo/intruder', thread_id: 'auto', shim_pid: 99002,
+    })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('thread_session_taken')
+    // holder info must be embedded in the message string
+    expect(ack2.message).toContain('pid=99001')
+    expect(ack2.message).toContain('/repo/holder-cwd')
+    expect(ack2.message).toContain(heldThreadId)
+  })
+
+  // Same diagnostics contract for DM-mode collisions.
+  test('duplicate DM register: register_err message includes holder pid + cwd', async () => {
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, {
+      type: 'register', id: 1, session_id: 'dm-holder', mode: 'dm',
+      cwd: '/repo/dm-holder-cwd', shim_pid: 88001,
+    })
+    expect((await recv(it1)).type).toBe('register_ack')
+
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, {
+      type: 'register', id: 1, session_id: 'dm-intruder', mode: 'dm',
+      cwd: '/repo/dm-intruder', shim_pid: 88002,
+    })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('dm_session_taken')
+    expect(ack2.message).toContain('pid=88001')
+    expect(ack2.message).toContain('/repo/dm-holder-cwd')
+    // DM-mode holders have no thread; describeHolder renders the field
+    // as `thread_id=dm` so the human message and structured log key
+    // agree (no `holder_thread_id` key is emitted in the log for DM).
+    expect(ack2.message).toContain('thread_id=dm')
+  })
+
+  // Same diagnostics contract for the "explicit thread_id already in
+  // threadIndex" collision path (different code branch than session_id
+  // collision — holder must be reverse-looked-up via threadIndex).
+  test('explicit thread already bound: register_err message includes holder pid + cwd', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, {
+      type: 'register', id: 1, session_id: 's-first', mode: 'thread',
+      cwd: '/repo/first-cwd', thread_id: 'auto', shim_pid: 77001,
+    })
+    const ack1 = await recv(it1)
+    expect(ack1.type).toBe('register_ack')
+    const threadId: string = ack1.thread_id
+
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, {
+      type: 'register', id: 1, session_id: 's-second', mode: 'thread',
+      cwd: '/repo/second-cwd', thread_id: threadId, shim_pid: 77002,
+    })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('thread_session_taken')
+    expect(ack2.message).toContain('pid=77001')
+    expect(ack2.message).toContain('/repo/first-cwd')
+  })
+
+  // Regression: finalize used to re-stamp `registered_at: Date.now()`,
+  // which silently subtracted the createThread / verifyThreadParent latency
+  // from the reported holder age. Now the placeholder's registered_at is
+  // preserved through finalize, so a collision arriving right after a
+  // *slow* register reports an age that includes the createThread delay.
+  test('thread register: holder age_sec is preserved across finalize (not reset)', async () => {
+    class SlowOps extends FakeDiscordOps {
+      override async createThread(parent_channel_id: string, name: string) {
+        // 80ms is large enough to robustly distinguish from a fresh
+        // Date.now() stamp (which would land within ~1ms) without making
+        // the test slow.
+        await new Promise(r => setTimeout(r, 80))
+        return super.createThread(parent_channel_id, name)
+      }
+    }
+    const ops = new SlowOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    // First shim: triggers the slow createThread, so finalize lands at
+    // T0 + ~80ms while the placeholder was set at T0.
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, {
+      type: 'register', id: 1, session_id: 'aged-sid', mode: 'thread',
+      cwd: '/repo/aged', thread_id: 'auto', shim_pid: 55001,
+    })
+    expect((await recv(it1)).type).toBe('register_ack')
+
+    // Second shim immediately after — without the fix, holder age_sec
+    // would be ~0.0 (re-stamped at finalize); with the fix it is at
+    // least the createThread delay.
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, {
+      type: 'register', id: 1, session_id: 'aged-sid', mode: 'thread',
+      cwd: '/repo/other', thread_id: 'auto', shim_pid: 55002,
+    })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('thread_session_taken')
+    // Extract age_sec from the message. Format: "age_sec=N.N".
+    const m = /age_sec=(\d+\.\d+)/.exec(ack2.message)
+    expect(m).toBeTruthy()
+    const age = parseFloat(m![1])
+    // 60ms buffer below the 80ms delay to absorb timer skew while still
+    // catching a regression that would re-stamp registered_at (age ≈ 0).
+    expect(age).toBeGreaterThanOrEqual(0.06)
+  })
+
+  // Old-shim compatibility: a register without shim_pid must still succeed
+  // and a later duplicate must report holder pid=? rather than crashing.
+  test('register without shim_pid still works; collision reports pid=?', async () => {
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, { type: 'register', id: 1, session_id: 'no-pid', mode: 'dm', cwd: '/x' })
+    expect((await recv(it1)).type).toBe('register_ack')
+
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, { type: 'register', id: 1, session_id: 'other', mode: 'dm', cwd: '/y' })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('dm_session_taken')
+    expect(ack2.message).toContain('pid=?')
+  })
+
   test('reply tool_call forwards to ops.reply and returns tool_result', async () => {
     const ops = new FakeDiscordOps()
     daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })

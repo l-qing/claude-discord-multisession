@@ -22,6 +22,13 @@ export const RegisterMsg = z.object({
    * needing the env var configured (or even the path to exist locally).
    */
   canonical_cwd: z.string().optional(),
+  /**
+   * Shim process pid, self-reported for diagnostics only. Lets the daemon
+   * embed "who is holding this session_id" into register_err messages and
+   * daemon.log entries when a duplicate register arrives. Optional — old
+   * shims simply omit it and the holder is reported with pid=?.
+   */
+  shim_pid: z.number().int().optional(),
 }).superRefine((v, ctx) => {
   if (v.mode === 'thread' && !v.thread_id) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'thread_id required when mode=thread' })

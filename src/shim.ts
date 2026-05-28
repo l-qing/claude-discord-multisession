@@ -363,6 +363,10 @@ export async function runShim(): Promise<void> {
   const ack = await send<{ type: 'register_ack' | 'register_err'; code?: string; message?: string }>({
     type: 'register', id: nextId++, session_id: SESSION_ID,
     mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
+    // Self-reported pid so the daemon can identify *this* shim as the
+    // holder if a later register collides with us. Diagnostics only —
+    // never used for authorization or routing.
+    shim_pid: process.pid,
     ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
     ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
     ...migrationHints,
