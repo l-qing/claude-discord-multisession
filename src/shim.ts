@@ -59,37 +59,109 @@ export function buildInstructions(reactionGuidanceOn: boolean): string {
 
 export type RegisterAck = { type: string; code?: string; message?: string; [k: string]: unknown }
 
-// Which register_err codes are worth retrying. Only the session-taken codes:
-// they mean another shim (or a just-superseded one) currently holds this
+// Register-error retry policy — two buckets, retried differently, both bounded
+// by one shared overall budget (see registerWithSelfHeal).
+//
+// session-taken: another shim (or a just-superseded one) currently holds this
 // session_id. Paired with the daemon's takeover-on-reconnect, a retry resolves
 // the narrow concurrent-race window — the loser re-sends, the winner has since
-// committed, and the retry takes over cleanly. Everything else
-// (parent_channel_unset, thread_not_allowed, bindings_*_failed) is a terminal
-// config/data error where retrying only delays the inevitable failure.
+// committed, and the retry takes over cleanly. It is an in-flight placeholder
+// race that clears in milliseconds, so this bucket uses a fast fixed delay.
 const RETRYABLE_REGISTER_CODES = new Set(['dm_session_taken', 'thread_session_taken'])
+
+// transient: the daemon reached Discord but a REST call inside the register
+// handshake failed (`discord_unavailable` = createThread / verifyThreadParent
+// threw). Discord recovers on a seconds scale (a 429 retry-after clearing, a
+// thread-cap easing, a transient 5xx), so this bucket uses exponential backoff.
+// Before this bucket existed the shim exited(1) on discord_unavailable, turning
+// one transient hiccup into a permanent "MCP failed, reconnect by hand" — the
+// exact ccd symptom this fix targets.
+const TRANSIENT_REGISTER_CODES = new Set(['discord_unavailable'])
+
+// Everything else (parent_channel_unset, thread_not_allowed, bindings_*_failed)
+// is a terminal config/data error where retrying only delays the inevitable.
+
+// Production self-heal tuning. The send timeout is widened from the historical
+// 30s: a slow-but-succeeding register (e.g. Discord rate-limiting thread
+// creation, retry-after < 60s) now lands in-band instead of the 30s hard-fail.
+// The overall budget bounds total self-heal wall-clock across all attempts.
+const REGISTER_SEND_TIMEOUT_MS = 60_000
+const REGISTER_SELF_HEAL_BUDGET_MS = 90_000
+const REGISTER_TRANSIENT_BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000]
 
 export function isRetryableRegisterCode(code: string | undefined): boolean {
   return code !== undefined && RETRYABLE_REGISTER_CODES.has(code)
 }
 
-// Send a register frame, retrying on transient session-taken errors with a
-// fixed delay. Returns the final ack (a success, a terminal error, or the last
-// error after exhausting retries) — the caller decides whether to exit. `send`
-// is a thunk so each attempt gets a fresh request id; `sleep` is injectable so
-// tests don't wait on real timers.
-export async function registerWithRetry(
-  send: () => Promise<RegisterAck>,
-  opts: { retries: number; delayMs: number; sleep?: (ms: number) => Promise<void> },
+export function isTransientRegisterCode(code: string | undefined): boolean {
+  return code !== undefined && TRANSIENT_REGISTER_CODES.has(code)
+}
+
+export type RegisterSelfHealOpts = {
+  // Hard wall-clock ceiling on the whole self-heal loop. Every send and every
+  // backoff sleep is clipped to the remaining budget so no single action can
+  // overrun it (a 60s send starting near the deadline must not run the full 60s).
+  overallDeadlineMs: number
+  // session-taken bucket: fixed short delay, capped attempt count — preserves the
+  // historical ~2s convergence and fast-fail on a genuinely taken session.
+  sessionTaken: { maxAttempts: number; delayMs: number }
+  // transient bucket: exponential backoff schedule; its length is the attempt cap.
+  transient: { backoffMs: number[] }
+  // Per-send timeout, clipped to the remaining budget by the loop.
+  sendTimeoutMs: number
+  now?: () => number
+  sleep?: (ms: number) => Promise<void>
+}
+
+// Send a register frame and self-heal transient failures within a bounded
+// budget. Returns the final ack: a success, a terminal register_err, or a
+// synthetic register_err once a bucket / the overall budget is exhausted or the
+// daemon stops responding — the caller decides whether to exit. `send` is a
+// thunk (fresh request id per attempt) that takes the clipped timeout; `now` /
+// `sleep` are injectable so tests drive the schedule without real timers.
+//
+// Scope A is shim-only: on a send timeout / socket error the daemon may still be
+// mid-handshake on this connection, and an in-band retry would just queue behind
+// it (the daemon reads one connection's frames serially), so that case is
+// terminal here — reconnect-and-re-register is deferred to Scope B.
+export async function registerWithSelfHeal(
+  send: (timeoutMs: number) => Promise<RegisterAck>,
+  opts: RegisterSelfHealOpts,
 ): Promise<RegisterAck> {
+  const now = opts.now ?? (() => Date.now())
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
-  let ack = await send()
-  let attemptsLeft = opts.retries
-  while (ack.type === 'register_err' && isRetryableRegisterCode(ack.code) && attemptsLeft > 0) {
-    attemptsLeft--
-    await sleep(opts.delayMs)
-    ack = await send()
+  const deadline = now() + opts.overallDeadlineMs
+  let sessionTakenLeft = opts.sessionTaken.maxAttempts
+  let transientIdx = 0
+  let last: RegisterAck | undefined
+  for (;;) {
+    const remaining = deadline - now()
+    if (remaining <= 0) {
+      return last ?? { type: 'register_err', code: 'self_heal_timeout', message: 'register self-heal budget exhausted' }
+    }
+    try {
+      last = await send(Math.min(opts.sendTimeoutMs, remaining))
+    } catch (err) {
+      // Daemon did not respond in time / socket died. Terminal in Scope A.
+      return { type: 'register_err', code: 'daemon_unresponsive', message: err instanceof Error ? err.message : String(err) }
+    }
+    if (last.type !== 'register_err') return last
+    let delay: number
+    if (isRetryableRegisterCode(last.code)) {
+      if (sessionTakenLeft <= 0) return last
+      sessionTakenLeft--
+      delay = opts.sessionTaken.delayMs
+    } else if (isTransientRegisterCode(last.code)) {
+      if (transientIdx >= opts.transient.backoffMs.length) return last
+      delay = opts.transient.backoffMs[transientIdx]!
+      transientIdx++
+    } else {
+      return last // terminal config/data error — retrying only delays the inevitable
+    }
+    const budgetLeft = deadline - now()
+    if (budgetLeft <= 0) return last
+    await sleep(Math.min(delay, budgetLeft))
   }
-  return ack
 }
 
 // Pure decision helper for the register-mode gate. Exported so tests can
@@ -419,13 +491,23 @@ export async function runShim(): Promise<void> {
     ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
     ...migrationHints,
   }
-  // Retry the narrow concurrent-race window (a sibling shim mid-register for
-  // the same session_id) for ~2s before giving up. The daemon takes over a
-  // committed session immediately, so this only ever loops on the in-flight
-  // placeholder race, which clears in milliseconds.
-  const ack = await registerWithRetry(
-    () => send<RegisterAck>({ ...registerFrame, id: nextId++ }),
-    { retries: 10, delayMs: 200 },
+  // Register with bounded self-heal. Two buckets share one budget:
+  //   - session-taken (a sibling shim mid-register for the same session_id) →
+  //     fast fixed-delay retry, the historical ~2s in-flight-race path.
+  //   - discord_unavailable (a REST call in the daemon's register handshake
+  //     threw) → exponential backoff, so a transient Discord hiccup self-heals
+  //     instead of the shim exiting(1) into "MCP failed, reconnect by hand".
+  // The send timeout is widened to 60s so a slow-but-succeeding register still
+  // lands in-band. Only after the budget is exhausted do we exit(1), which lets
+  // CC surface a clear failure rather than a silent hang.
+  const ack = await registerWithSelfHeal(
+    (timeoutMs) => send<RegisterAck>({ ...registerFrame, id: nextId++ }, { timeoutMs }),
+    {
+      overallDeadlineMs: REGISTER_SELF_HEAL_BUDGET_MS,
+      sessionTaken: { maxAttempts: 10, delayMs: 200 },
+      transient: { backoffMs: REGISTER_TRANSIENT_BACKOFF_MS },
+      sendTimeoutMs: REGISTER_SEND_TIMEOUT_MS,
+    },
   )
   if (ack.type !== 'register_ack') {
     process.stderr.write(`discord shim: register failed (${ack.code}): ${ack.message}\n`)

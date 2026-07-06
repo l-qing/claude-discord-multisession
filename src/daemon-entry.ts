@@ -9,7 +9,7 @@
 import {
   Client, Events, GatewayIntentBits, Partials, ChannelType, MessageFlags,
   ButtonBuilder, ButtonStyle, ActionRowBuilder,
-  type Message, type Interaction,
+  type Message, type Interaction, type RateLimitData,
 } from 'discord.js'
 import { readFileSync, chmodSync, readdirSync, rmSync, mkdirSync } from 'fs'
 import { join } from 'path'
@@ -54,6 +54,18 @@ export async function runDaemon(): Promise<void> {
       GatewayIntentBits.MessageContent,
     ],
     partials: [Partials.Channel],
+  })
+
+  // Diagnostic: log Discord REST rate-limit hits. The register handshake's
+  // createThread is the prime suspect for the intermittent "MCP connect stalls
+  // then fails" — if discord.js is transparently waiting out a thread-creation
+  // 429, it surfaces here with the route + how long it will wait, confirming or
+  // refuting the rate-limit hypothesis without guessing from shim-side timings.
+  client.rest.on('rateLimited', (info: RateLimitData) => {
+    process.stderr.write(
+      `discord daemon: rateLimited route=${info?.route} method=${info?.method} ` +
+      `global=${info?.global} timeToResetMs=${info?.timeToReset} limit=${info?.limit}\n`,
+    )
   })
 
   const accessFile = join(stateDir, 'access.json')

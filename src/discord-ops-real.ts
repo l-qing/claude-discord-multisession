@@ -160,13 +160,40 @@ export class RealDiscordOps implements DiscordOps {
   }
 
   async createThread(parent_channel_id: string, name: string): Promise<ThreadInfo> {
-    const parent = await this.fetchTextChannel(parent_channel_id)
-    if (!('threads' in parent)) {
-      throw new Error(`channel ${parent_channel_id} cannot host threads`)
+    // Segment timing (diagnostic): createThread is the register-handshake step
+    // that occasionally spikes from ~0.4s to 10s+ and blocks the shim's MCP
+    // connect. Log each Discord REST leg separately so the next incident shows
+    // whether the time is in fetchTextChannel or threads.create, instead of
+    // inferring it from the shim's total registerMs. Paired with the daemon's
+    // rateLimited hook this reveals whether a 429 retry-after is the cause.
+    const t0 = Date.now()
+    let tFetched = -1
+    let tCreated = -1
+    let ok = false
+    try {
+      const parent = await this.fetchTextChannel(parent_channel_id)
+      tFetched = Date.now()
+      if (!('threads' in parent)) {
+        throw new Error(`channel ${parent_channel_id} cannot host threads`)
+      }
+      const t = await parent.threads.create({ name, autoArchiveDuration: 1440 })
+      tCreated = Date.now()
+      ok = true
+      const url = parent.guildId ? `https://discord.com/channels/${parent.guildId}/${t.id}` : undefined
+      return { thread_id: t.id, thread_name: t.name, thread_url: url }
+    } finally {
+      // Log on BOTH success and failure: the slow-then-throwing sample is the one
+      // that trips the shim's self-heal, so it is the most important to capture.
+      // -1 sentinels mark a leg that never completed (its time rolls into the
+      // segment that was in-flight when it threw).
+      const end = Date.now()
+      const fetchMs = (tFetched >= 0 ? tFetched : end) - t0
+      const createMs = tFetched >= 0 ? (tCreated >= 0 ? tCreated : end) - tFetched : 0
+      process.stderr.write(
+        `discord daemon: createThread timing parent=${parent_channel_id} ok=${ok} ` +
+        `fetchMs=${fetchMs} createMs=${createMs} totalMs=${end - t0}\n`,
+      )
     }
-    const t = await parent.threads.create({ name, autoArchiveDuration: 1440 })
-    const url = parent.guildId ? `https://discord.com/channels/${parent.guildId}/${t.id}` : undefined
-    return { thread_id: t.id, thread_name: t.name, thread_url: url }
   }
 
   async verifyThreadParent(thread_id: string): Promise<string | null> {

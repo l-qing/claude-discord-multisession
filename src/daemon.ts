@@ -704,12 +704,27 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                   continue
                 }
                 const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
+                // Segment timing (diagnostic): pinpoint which register-handshake
+                // step is slow when a new session's MCP connect stalls. waitReady
+                // should be ~0 on a warm daemon; createThread is the prime suspect.
+                const _tStart = Date.now()
+                let _tReady = _tStart
+                let _tCreated = _tStart
                 try {
                   if (waitReady) await waitReady()
+                  _tReady = Date.now()
                   const t = await ops.createThread(access.parentChannelId, name)
+                  _tCreated = Date.now()
                   threadId = t.thread_id
                   parentId = access.parentChannelId
                 } catch (err) {
+                  // Timing on the FAILURE path too — this is the createThread that
+                  // tripped the shim self-heal, the most valuable one to diagnose.
+                  process.stderr.write(
+                    `discord daemon: register timing session=${msg.session_id} ` +
+                    `waitReadyMs=${_tReady - _tStart} createThreadMs=${Date.now() - _tReady} ` +
+                    `bindingMs=na outcome=createThread_failed\n`,
+                  )
                   const errMessage = `createThread failed: ${err instanceof Error ? err.message : String(err)}`
                   writeFrame(sock, { type: 'register_err', id: msg.id, code: 'discord_unavailable', message: errMessage })
                   logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'discord_unavailable', message: errMessage })
@@ -739,6 +754,11 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                   logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'bindings_save_failed', message: errMessage })
                   continue
                 }
+                process.stderr.write(
+                  `discord daemon: register timing session=${msg.session_id} ` +
+                  `waitReadyMs=${_tReady - _tStart} createThreadMs=${_tCreated - _tReady} ` +
+                  `bindingMs=${Date.now() - _tCreated}\n`,
+                )
                 // reuseFlag stays false: this is a brand-new binding.
               }
             } else {
